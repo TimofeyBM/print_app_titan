@@ -6,7 +6,7 @@ from sqlalchemy.orm import joinedload
 from sqlalchemy.exc import NoResultFound
 
 from app.db.database import session_scope, session_scope_serializable, advisory_xact_lock
-from app.db.models import Setting, Article, Shift, TaskItem, CollectorHistory, CheckHistory
+from app.db.models import Settings, Article, Shift, TaskItem, CollectorHistory, CheckHistory
 from app.core.constants import SUPPORTED_PRINTER_EXTS, DEFAULT_CANCEL_PASSWORD
 
 # --- helpers ---
@@ -61,19 +61,21 @@ class SettingsRepository:
 
 # --- Task ---
 class TaskRepository:
-    def start_new_shift(self, collector: str):
+    def start_new_shift(self, started_by_role=None, started_by_computer=None):
         with session_scope() as s:
-            # закрыть все открытые смены для этого сборщика
-            s.execute(
-                update(Shift)
-                .where(Shift.collector == collector, Shift.is_open == True)
-                .values(is_open=False, ended_at=datetime.utcnow())
+            shift = Shift(
+                status="open",
+                started_at=datetime.now(),
             )
+            # новые поля
+            if started_by_role:
+                shift.started_by_role = started_by_role
+            if started_by_computer:
+                shift.started_by_computer = started_by_computer
 
-            sh = Shift(started_at=datetime.utcnow(), is_open=True, collector=collector)
-            s.add(sh)
+            s.add(shift)
             s.flush()
-            return sh.id
+            return shift.id
 
     def continue_open_shift(self) -> Optional[int]:
         with session_scope() as s:
@@ -146,52 +148,27 @@ class TaskRepository:
             tot = s.execute(select(func.coalesce(func.sum(TaskItem.remaining_copies), 0)).where(TaskItem.shift_id == sh.id)).scalar_one()
             return int(tot)
 
-    def pick_next_available_and_decrement(self, order: str = "fifo") -> tuple[str, int] | None:
-        """
-        Детерминированный выбор следующей позиции с remaining>0 под блокировкой и уменьшение remaining на 1.
-        order:
-          - "fifo"              -> по TaskItem.id ASC (первый добавленный)
-          - "code_asc"          -> по Article.code ASC
-          - "largest_remaining" -> по remaining DESC, затем id ASC
-        Возвращает (article_code, remaining_after) или None.
-        """
+    def pick_random_available_and_decrement(self) -> tuple[str, int] | None:
         with session_scope() as s:
             sh = _get_open_shift(s)
-            base = (
+            if not sh:
+                return None
+            stmt = (
                 select(TaskItem)
                 .where(TaskItem.shift_id == sh.id, TaskItem.remaining_copies > 0)
+                .order_by(func.random())
+                .limit(1)
+                .with_for_update(skip_locked=True)
             )
-
-            if order == "code_asc":
-                stmt = (
-                    base.join(Article, TaskItem.article_id == Article.id)
-                    .order_by(Article.code.asc())
-                    .limit(1)
-                    .with_for_update(skip_locked=True)
-                )
-            elif order == "largest_remaining":
-                stmt = (
-                    base.order_by(TaskItem.remaining_copies.desc(), TaskItem.id.asc())
-                    .limit(1)
-                    .with_for_update(skip_locked=True)
-                )
-            else:  # fifo
-                stmt = (
-                    base.order_by(TaskItem.id.asc())
-                    .limit(1)
-                    .with_for_update(skip_locked=True)
-                )
-
             ti = s.execute(stmt).scalar_one_or_none()
             if not ti:
                 return None
-
             ti.remaining_copies -= 1
             code = s.get(Article, ti.article_id).code
             left = ti.remaining_copies
-            s.add(ti);
-            s.flush()
+            s.add(ti); s.flush()
             return code, left
+
 
     # --- импорт/экспорт задания ---
     def import_task_rows(self, rows: list[dict], mode: str = "merge") -> None:

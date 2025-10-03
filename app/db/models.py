@@ -5,9 +5,10 @@ from sqlalchemy.dialects.postgresql import JSONB
 
 Base = declarative_base()
 
-class Setting(Base):
+class Settings(Base):
     __tablename__ = "settings"
     id = Column(Integer, primary_key=True, default=1)
+    computer_name = Column(String(255), nullable=True, unique=True)  # 👈 добавляем сюда
     base_dir = Column(Text, nullable=False, default="")
     auto_save_dir = Column(Text, nullable=False, default="")
     temp_save_dir = Column(Text, nullable=False, default="")
@@ -28,6 +29,8 @@ class Shift(Base):
     id = Column(BigInteger, primary_key=True)
     started_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     ended_at = Column(DateTime(timezone=True))
+    started_by_role = Column(String(50), nullable=True)
+    started_by_computer = Column(String(255), nullable=True)
     status = Column(String(20), nullable=False, default="open", index=True)
     task_items = relationship("TaskItem", back_populates="shift", cascade="all, delete-orphan")
 

@@ -3,7 +3,7 @@ import threading
 import time
 import random
 from datetime import datetime
-
+import platform
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog, simpledialog
 
@@ -20,19 +20,27 @@ from app.services.history_service_db import HistoryServiceDB as HistoryService
 from app.services.label_service import LabelService
 from app.services.import_export_service_db import ImportExportServiceDB
 
-def ask_collector(collectors_list):
-    """Показывает окно выбора сборщика перед запуском программы"""
-    dialog = tk.Toplevel()
-    dialog.title("Выбор сборщика")
-    dialog.geometry("300x150")
-    dialog.grab_set()  # блокирует основное окно
+ROLES = ("Админ", "Начальник смены", "Сборщик", "Проверяющий")
 
-    tk.Label(dialog, text="Выберите сборщика:", font=("Arial", 12)).pack(pady=10)
-
-    collector_var = tk.StringVar()
-    combo = ttk.Combobox(dialog, textvariable=collector_var, values=collectors_list, width=25, state="readonly")
-    combo.pack(pady=5)
-    combo.current(0)  # выбираем первого по умолчанию
+def ask_role_dialog(root) -> str | None:
+    import tkinter as tk
+    from tkinter import ttk, messagebox
+    dlg = tk.Toplevel(root)
+    dlg.title("Авторизация")
+    dlg.geometry("320x160")
+    dlg.grab_set()
+    tk.Label(dlg, text="Выберите роль:", font=("Arial", 11)).pack(pady=12)
+    var = tk.StringVar()
+    cb = ttk.Combobox(dlg, textvariable=var, values=ROLES, state="readonly", width=27)
+    cb.pack(pady=5)
+    cb.current(0)
+    def ok():
+        if not var.get():
+            messagebox.showwarning("Внимание", "Выберите роль"); return
+        dlg.destroy()
+    ttk.Button(dlg, text="ОК", command=ok).pack(pady=10)
+    dlg.wait_window()
+    return var.get() or None # выбираем первого по умолчанию
 
     def confirm():
         if not collector_var.get():
@@ -53,6 +61,12 @@ class PrintApp:
         self.root.title("Печать файлов по артикулу (PostgreSQL)")
         self.root.geometry("980x840")
 
+        self.current_role = ask_role_dialog(self.root)  # новое
+        if not self.current_role:
+            self.root.destroy();
+            return
+        self.computer_name = os.environ.get("COMPUTERNAME") or platform.node()
+
         # --- сервисы ---
         self.settings_srv = SettingsService()
         self.io_srv = IOService()
@@ -63,9 +77,10 @@ class PrintApp:
         self.imp_exp_srv = ImportExportServiceDB()
 
         # --- загрузка настроек ---
-        self.settings = self.settings_srv.load()
+        # self.settings = self.settings_srv.load()
         # после self.settings = self.settings_srv.load() и var'ов base_dir/auto/temp
 
+        self.settings = self.settings_srv.load_for_computer(self.computer_name)
         self.cancel_password = self.settings.get("cancel_password", DEFAULT_CANCEL_PASSWORD)
 
         self.base_dir = tk.StringVar(value=self.settings["base_dir"])
@@ -76,6 +91,7 @@ class PrintApp:
         self.collectors_list = list(self.settings.get("collectors_list", []))
         self.inspectors_list = list(self.settings.get("inspectors_list", []))
         self.printer_settings = dict(self.settings.get("printer_settings", {}))
+
         use_emul = os.getenv("PRINT_EMULATE", "0") == "1"
         if use_emul:
             from app.services.printer_emulator import EmulatedPrinterService
@@ -170,9 +186,15 @@ class PrintApp:
         self.entry.bind("<Return>", lambda e: self.print_single_article())
 
         ttk.Label(self.assembly_frame, text="Копий:").grid(row=1, column=2, sticky="w", pady=5)
-        self.copies_entry = ttk.Entry(self.assembly_frame, width=10)
-        self.copies_entry.insert(0, "1")
-        self.copies_entry.grid(row=1, column=3, pady=5, padx=5)
+        # self.copies_entry = ttk.Entry(self.assembly_frame, width=10)
+        # self.copies_entry.insert(0, "1")
+        # self.copies_entry.grid(row=1, column=3, pady=5, padx=5)
+        # self.copies_entry.delete(0, tk.END)
+        # self.copies_entry.insert(0, "1")
+        # self.copies_entry.configure(state="disabled")
+        self.entry = ttk.Entry(self.assembly_frame, width=30)
+        self.entry.grid(row=1, column=1, pady=5, padx=5)
+        self.entry.bind("<Return>", lambda e: self.print_single_article())
 
         ttk.Button(self.assembly_frame, text="Печать", command=self.print_single_article).grid(row=1, column=4, padx=5)
 
@@ -440,14 +462,30 @@ class PrintApp:
             "base_dir": self.base_dir.get(),
             "auto_save_dir": self.auto_save_dir.get(),
             "temp_save_dir": self.temp_save_dir.get(),
-            "task_folder_path": self.task_folder_path.get(),
             "collectors_list": self.collectors_list,
             "inspectors_list": self.inspectors_list,
             "printer_settings": self.printer_settings,
-            "cancel_password": self.cancel_password
+            "cancel_password": self.cancel_password,
         }
-        self.settings_srv.save(data)
-        self.log("Настройки сохранены.")
+        self.settings_srv.save_for_computer(data, computer_name=self.computer_name)
+        self.log(f"Настройки сохранены для ПК: {self.computer_name}.")
+
+    def apply_role_permissions(self):
+        can_start_shift = self.current_role in ("Админ", "Начальник смены")
+        can_collect = self.current_role in ("Админ", "Сборщик")
+        can_check = self.current_role in ("Админ", "Проверяющий")
+
+        # Кнопки смены
+        self.start_shift_button.config(state="normal" if can_start_shift else "disabled")
+        self.continue_shift_button.config(state="normal")  # любой может подключиться к открытой смене
+
+        # Кнопки действий (зависят от открытой смены)
+        if not self.shift_started:
+            self.collect_button.config(state="disabled")
+            self.check_button.config(state="disabled")
+        else:
+            self.collect_button.config(state="normal" if can_collect else "disabled")
+            self.check_button.config(state="normal" if can_check else "disabled")
 
     # ------------- Вкладка Сборка -------------
     def select_file(self):
@@ -497,12 +535,9 @@ class PrintApp:
     def print_single_article(self):
         art = self.entry.get().strip()
         if not art:
-            messagebox.showerror("Ошибка", "Введите артикул!"); return
-        try:
-            copies = max(1, int(self.copies_entry.get() or 1))
-        except Exception:
-            copies = 1
-        self._print_article(art, copies, manual=True)
+            messagebox.showerror("Ошибка", "Введите артикул!");
+            return
+        self._print_article(art, copies=1, manual=True)
 
     def start_print_all_thread(self):
         if self.printing_in_progress:
@@ -582,51 +617,57 @@ class PrintApp:
         t = threading.Thread(target=self._execute_task, args=(name,), daemon=True)
         t.start()
 
-    def _execute_task(self, collector_name: str):
+    def _execute_task(self):
+        if not self.shift_started:
+            messagebox.showwarning("Внимание", "Смена не начата. Попросите начальника начать смену.");
+            return
+        if self.current_role not in ("Админ", "Сборщик"):
+            messagebox.showwarning("Доступ запрещен", "Только сборщик или админ могут собирать.");
+            return
+
         self.printing_in_progress = True
         self.task_status_var.set("Выполнение задания...")
 
-        # атомарный выбор позиции с уменьшением remaining (FOR UPDATE SKIP LOCKED)
         try:
-            pick = self.task_srv.pick_next_available_and_decrement(order="fifo")
+            # случайный выбор и уменьшение remaining с блокировкой
+            pick = self.task_srv.pick_random_available_and_decrement()
         except Exception as e:
             self.task_status_var.set("Ошибка БД при выборе задания")
             self.log(f"Ошибка выбора задания: {e}")
-            self.printing_in_progress = False
+            self.printing_in_progress = False;
             return
 
         if not pick:
-            self.task_status_var.set("Все копии распечатаны!")
-            self.log("Все копии распечатаны в режиме задания")
-            self.printing_in_progress = False; return
+            self.task_status_var.set("Все артикула отпечатаны!")
+            self.log("Все артикула отпечатаны");
+            self.printing_in_progress = False;
+            return
 
-        article, left = pick
-        self.log(f"Режим задания: сборщик '{collector_name}', выбран '{article}' (осталось после уменьшения: {left})")
+        article, left = pick  # left ∈ {0,1} после уменьшения
+        self.log(f"Сборка: выбран '{article}' (осталось после уменьшения: {left})")
 
-        ok = self._print_article_task(article)
+        ok = self._print_article_task(article)  # печать всех файлов кроме .btw, ровно 1 раз
         if not ok:
-            # компенсируем уменьшение remaining
+            # компенсируем уменьшение (вернуть 1)
             try:
                 self.task_srv.inc_remaining(article, by=1)
             except Exception as e:
                 self.log(f"Ошибка компенсации remaining для '{article}': {e}")
             self.task_status_var.set(f"Ошибка печати: {article}")
             messagebox.showerror("Ошибка", "Проверьте принтер!")
-            self.printing_in_progress = False; return
+            self.printing_in_progress = False;
+            return
 
+        # история: записываем действие от имени ПК (так как имени сборщика нет)
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        self.collector_data.append({'collector': collector_name, 'article': article, 'datetime': now, 'copies': 1})
+        self.collector_data.append({'collector': self.computer_name, 'article': article, 'datetime': now, 'copies': 1})
         self.hist_srv.save_collector_data("", [self.collector_data[-1]])
 
-        self.last_collector_time[collector_name] = time.time()
-        self.update_collector_button_state()
-
+        # обновим UI
         self.articles_data, self.remaining_copies = self.task_srv.load_task("")
         self.update_collector_table()
-
-        self.task_status_var.set(f"Сборщик: {collector_name}, артикул: {article}")
+        self.task_status_var.set(f"Отпечатано: {article}")
         self._update_task_info()
-        self.update_article_lists()
         self.printing_in_progress = False
 
     def cancel_last_task(self):
@@ -693,7 +734,14 @@ class PrintApp:
         t.start()
 
     def _execute_check(self, inspector_name: str, article: str):
+        if not self.shift_started:
+            messagebox.showwarning("Внимание", "Смена не начата. Попросите начальника начать смену.");
+            return
+        if self.current_role not in ("Админ", "Проверяющий"):
+            messagebox.showwarning("Доступ запрещен", "Только проверяющий или админ могут выполнять проверку.");
+            return
         self.check_status_var.set("Проверка...")
+
         if not self._print_btw_files(article):
             self.check_status_var.set(f"Ошибка печати: {article}")
             self.log(f"Ошибка печати .btw для '{article}'")
@@ -995,32 +1043,31 @@ class PrintApp:
 
     # ------------- Смена / задание -------------
     def start_shift(self):
-        name = self.collector_var.get().strip()
-        if not name:
-            messagebox.showwarning("Внимание", "Выберите сборщика для начала смены!")
+        if self.current_role not in ("Админ", "Начальник смены"):
+            messagebox.showwarning("Доступ запрещен", "Только начальник смены или админ могут начинать смену.")
             return
-
-        if messagebox.askyesno("Начать смену", f"Начать смену для сборщика {name}? Текущие данные будут очищены."):
-            self.task_srv.start_new_shift(name)
+        if messagebox.askyesno("Начать смену", "Начать новую смену для всех? Текущие UI-данные будут очищены."):
+            self.task_srv.start_new_shift(started_by_role=self.current_role, started_by_computer=self.computer_name)
             self.articles_data, self.remaining_copies = self.task_srv.load_task("")
-            self._rebuild_assembly_table()
+            self._rebuild_assembly_table();
             self._update_task_info()
             self.shift_started = True
-            self.shift_button_var.set(f"Смена начата ({name})")
-            self._update_buttons_state()
-            self.log(f"Новая смена начата для {name}")
+            self.shift_button_var.set(f"Смена начата ({self.current_role})")
+            self.apply_role_permissions()
+            self.log(f"Новая смена начата: роль={self.current_role}, ПК={self.computer_name}")
 
     def continue_shift(self):
-        sid = self.task_srv.continue_open_shift()
+        sid = self.task_srv.continue_open_shift()  # ищем открытую смену без привязки к имени
         if sid:
             self.articles_data, self.remaining_copies = self.task_srv.load_task("")
-            self._rebuild_assembly_table(); self._update_task_info()
-            self.update_article_lists()
-            self.shift_started = True; self.shift_button_var.set("Смена продолжена")
-            self._update_buttons_state(); self.log(f"Смена продолжена (shift_id={sid})")
-            self.start_shift_button.config(state="normal"); self.continue_shift_button.config(state="disabled")
+            self._rebuild_assembly_table();
+            self._update_task_info()
+            self.shift_started = True
+            self.shift_button_var.set("Смена подключена")
+            self.apply_role_permissions()
+            self.log(f"Подключились к открытой смене (shift_id={sid})")
         else:
-            messagebox.showwarning("Внимание", "Нет открытой смены! Начните новую.")
+            messagebox.showwarning("Внимание", "Нет открытой смены. Попросите начальника смены её начать.")
 
     def _update_buttons_state(self):
         if self.shift_started:
@@ -1086,7 +1133,7 @@ def run_app():
     # допустим, у нас список сборщиков в настройках
     collectors_list = ["Иванов", "Петров", "Сидоров"]
 
-    selected_collector = ask_collector(collectors_list)
+    selected_collector = ask_role_dialog(root)
     if not selected_collector:
         root.destroy()
         return
